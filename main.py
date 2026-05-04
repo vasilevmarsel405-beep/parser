@@ -9,7 +9,7 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import gspread
 import instaloader
@@ -488,6 +488,84 @@ def _instagram_request_timeout() -> float:
         return 45.0
 
 
+def _instagram_proxies() -> Optional[Dict[str, str]]:
+    """HTTPS-прокси для Instagram (часто нужен с датацентровых IP)."""
+    p = (os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    if not p:
+        return None
+    return {"http": p, "https": p}
+
+
+def _ig_www_auth() -> Tuple[Dict[str, str], Dict[str, str], float]:
+    """Куки и заголовки для публичного API на www.instagram.com (fallback к i.instagram.com)."""
+    raw_sid = os.getenv("INSTAGRAM_SESSION_ID", "").strip()
+    session_id = unquote(raw_sid)
+    csrf = (os.getenv("INSTAGRAM_CSRF_TOKEN") or "").strip()
+    ua = (os.getenv("INSTAGRAM_USER_AGENT") or "").strip() or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    timeout = _instagram_request_timeout()
+    cookies: Dict[str, str] = {"sessionid": session_id}
+    if session_id and ":" in session_id:
+        cookies["ds_user_id"] = session_id.split(":")[0]
+    if csrf:
+        cookies["csrftoken"] = csrf
+    headers = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-ASBD-ID": "129477",
+        "Referer": "https://www.instagram.com/",
+    }
+    if csrf:
+        headers["X-CSRFToken"] = csrf
+    return cookies, headers, timeout
+
+
+def _ig_web_profile_info_via_www(username: str) -> Dict[str, Any]:
+    cookies, headers, timeout = _ig_www_auth()
+    proxies = _instagram_proxies()
+    r = requests.get(
+        "https://www.instagram.com/api/v1/users/web_profile_info/",
+        params={"username": username},
+        headers=headers,
+        cookies=cookies,
+        timeout=timeout,
+        proxies=proxies,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    j = r.json()
+    if j.get("status") != "ok":
+        raise RuntimeError(j.get("message") or str(j)[:400])
+    return j
+
+
+def _ig_feed_via_www(user_id: Union[str, int], count: int, max_id: Optional[str]) -> Dict[str, Any]:
+    cookies, headers, timeout = _ig_www_auth()
+    proxies = _instagram_proxies()
+    params: Dict[str, str] = {"count": str(min(50, count))}
+    if max_id:
+        params["max_id"] = max_id
+    r = requests.get(
+        f"https://www.instagram.com/api/v1/feed/user/{user_id}/",
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        timeout=timeout,
+        proxies=proxies,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    j = r.json()
+    if j.get("status") == "fail":
+        raise RuntimeError(j.get("message") or str(j)[:400])
+    return j
+
+
 def _get_instaloader() -> Optional[instaloader.Instaloader]:
     """Единый экземпляр Instaloader. Авторизация через sessionid из браузера — пароль не нужен."""
     global _INSTALOADER
@@ -525,6 +603,10 @@ def _get_instaloader() -> Optional[instaloader.Instaloader]:
         "sessionid": session_id,
         "ds_user_id": session_id.split(":")[0] if ":" in session_id else "",
     })
+    px = _instagram_proxies()
+    if px:
+        L.context._session.proxies.update(px)
+        print("[instagram] для instaloader включён прокси (INSTAGRAM_PROXY / HTTPS_PROXY)")
     # Сообщаем instaloader какой логин у сессии
     L.context._username = username
 
@@ -582,11 +664,25 @@ def fetch_instagram_posts(
             else:
                 break
     if data is None:
-        exc = profile_exc or RuntimeError("web_profile_info: нет ответа")
-        print(f"[instagram] не удалось получить профиль @{account}: {exc}")
-        if errors is not None:
-            _append_error(errors, person_name, "instagram", account, "profile_error", str(exc)[:300])
-        return []
+        try:
+            data = _ig_web_profile_info_via_www(account)
+            print(
+                f"[instagram] профиль @{account}: ответ с www.instagram.com "
+                f"(i.instagram.com с этого сервера часто таймаутится — это нормальный обход)"
+            )
+        except Exception as www_exc:
+            exc = profile_exc or www_exc
+            print(
+                f"[instagram] не удалось получить профиль @{account}. "
+                f"i.instagram.com: {profile_exc!s}; www: {www_exc}"
+            )
+            print(
+                "[instagram] Подсказка: добавь в .env INSTAGRAM_CSRF_TOKEN из кук браузера "
+                "и/или INSTAGRAM_PROXY (резидентский HTTPS-прокси), обнови sessionid."
+            )
+            if errors is not None:
+                _append_error(errors, person_name, "instagram", account, "profile_error", str(exc)[:300])
+            return []
     try:
         user_info = data.get("data", {}).get("user") or {}
         user_id = user_info.get("id")
@@ -613,10 +709,25 @@ def fetch_instagram_posts(
                 params=params
             )
         except Exception as exc:
-            print(f"[instagram] feed error @{account} стр.{page+1}: {exc}")
-            if errors is not None:
-                _append_error(errors, person_name, "instagram", account, "feed_error", str(exc)[:300])
-            break
+            err_s = str(exc).lower()
+            if any(x in err_s for x in ("timeout", "timed out", "connection")):
+                try:
+                    feed = _ig_feed_via_www(user_id, min(50, max_items), max_id)
+                    if page == 0:
+                        print(
+                            f"[instagram] лента @{account}: www.instagram.com "
+                            f"(i.instagram.com не ответил — fallback)"
+                        )
+                except Exception as exc2:
+                    print(f"[instagram] feed error @{account} стр.{page+1}: {exc}; www-fallback: {exc2}")
+                    if errors is not None:
+                        _append_error(errors, person_name, "instagram", account, "feed_error", str(exc2)[:300])
+                    break
+            else:
+                print(f"[instagram] feed error @{account} стр.{page+1}: {exc}")
+                if errors is not None:
+                    _append_error(errors, person_name, "instagram", account, "feed_error", str(exc)[:300])
+                break
 
         items = feed.get("items", [])
         if not items:
