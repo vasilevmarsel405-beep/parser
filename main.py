@@ -593,7 +593,7 @@ def _get_instaloader() -> Optional[instaloader.Instaloader]:
         save_metadata=False,
         compress_json=False,
         quiet=True,
-        max_connection_attempts=3,
+        max_connection_attempts=1,
         iphone_support=True,
         request_timeout=_instagram_request_timeout(),
     )
@@ -637,52 +637,46 @@ def fetch_instagram_posts(
     fetched_at = now_iso()
     max_items = (history_cap if history_cap else 500) if full_history else limit
 
-    # Получаем user_id через iphone API (без GraphQL); ретраи при таймаутах/сети
+    # Сначала www — с IP датацентра i.instagram.com часто не отвечает минутами; потом короткий fallback на i.
     data: Optional[dict] = None
-    profile_exc: Optional[BaseException] = None
-    for attempt in range(1, 5):
-        try:
-            data = L.context.get_iphone_json(
-                "api/v1/users/web_profile_info/",
-                params={"username": account},
-            )
-            break
-        except Exception as exc:
-            profile_exc = exc
-            err_s = str(exc).lower()
-            retryable = any(
-                x in err_s
-                for x in ("timeout", "timed out", "connection", "443", "reset", "temporar")
-            )
-            if attempt < 4 and retryable:
-                wait = min(5 * attempt, 25)
-                print(
-                    f"[instagram] web_profile_info @{account}: попытка {attempt}/4 — {exc}; "
-                    f"пауза {wait}s"
+    www_exc: Optional[BaseException] = None
+    iphone_exc: Optional[BaseException] = None
+    try:
+        data = _ig_web_profile_info_via_www(account)
+        print(f"[instagram] профиль @{account}: www.instagram.com")
+    except Exception as exc:
+        www_exc = exc
+        print(f"[instagram] www web_profile_info @{account}: {exc}")
+    if data is None and not (os.getenv("INSTAGRAM_SKIP_IPHONE") or "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        print(f"[instagram] пробую i.instagram.com для @{account}…")
+        for attempt in range(1, 3):
+            try:
+                data = L.context.get_iphone_json(
+                    "api/v1/users/web_profile_info/",
+                    params={"username": account},
                 )
-                time.sleep(wait)
-            else:
+                print(f"[instagram] профиль @{account}: i.instagram.com (fallback)")
                 break
+            except Exception as exc:
+                iphone_exc = exc
+                if attempt < 2:
+                    print(f"[instagram] i.instagram web_profile_info попытка {attempt}/2: {exc}")
+                    time.sleep(4)
     if data is None:
-        try:
-            data = _ig_web_profile_info_via_www(account)
-            print(
-                f"[instagram] профиль @{account}: ответ с www.instagram.com "
-                f"(i.instagram.com с этого сервера часто таймаутится — это нормальный обход)"
-            )
-        except Exception as www_exc:
-            exc = profile_exc or www_exc
-            print(
-                f"[instagram] не удалось получить профиль @{account}. "
-                f"i.instagram.com: {profile_exc!s}; www: {www_exc}"
-            )
-            print(
-                "[instagram] Подсказка: добавь в .env INSTAGRAM_CSRF_TOKEN из кук браузера "
-                "и/или INSTAGRAM_PROXY (резидентский HTTPS-прокси), обнови sessionid."
-            )
-            if errors is not None:
-                _append_error(errors, person_name, "instagram", account, "profile_error", str(exc)[:300])
-            return []
+        exc = www_exc or iphone_exc or RuntimeError("нет ответа")
+        print(
+            f"[instagram] не удалось получить профиль @{account}: www: {www_exc!s}; "
+            f"i.instagram: {iphone_exc!s}"
+        )
+        print(
+            "[instagram] Добавь в .env INSTAGRAM_CSRF_TOKEN (куки браузера) и при необходимости "
+            "INSTAGRAM_PROXY. Полностью отключить i.instagram.com: INSTAGRAM_SKIP_IPHONE=1"
+        )
+        if errors is not None:
+            _append_error(errors, person_name, "instagram", account, "profile_error", str(exc)[:300])
+        return []
     try:
         user_info = data.get("data", {}).get("user") or {}
         user_id = user_info.get("id")
@@ -703,28 +697,29 @@ def fetch_instagram_posts(
         params: dict = {"count": min(50, max_items)}
         if max_id:
             params["max_id"] = max_id
+        feed: Optional[dict] = None
         try:
-            feed = L.context.get_iphone_json(
-                f"api/v1/feed/user/{user_id}/",
-                params=params
-            )
-        except Exception as exc:
-            err_s = str(exc).lower()
-            if any(x in err_s for x in ("timeout", "timed out", "connection")):
-                try:
-                    feed = _ig_feed_via_www(user_id, min(50, max_items), max_id)
-                    if page == 0:
-                        print(
-                            f"[instagram] лента @{account}: www.instagram.com "
-                            f"(i.instagram.com не ответил — fallback)"
-                        )
-                except Exception as exc2:
-                    print(f"[instagram] feed error @{account} стр.{page+1}: {exc}; www-fallback: {exc2}")
-                    if errors is not None:
-                        _append_error(errors, person_name, "instagram", account, "feed_error", str(exc2)[:300])
-                    break
-            else:
-                print(f"[instagram] feed error @{account} стр.{page+1}: {exc}")
+            feed = _ig_feed_via_www(user_id, min(50, max_items), max_id)
+        except Exception as www_feed_exc:
+            if (os.getenv("INSTAGRAM_SKIP_IPHONE") or "").strip().lower() in ("1", "true", "yes"):
+                print(f"[instagram] feed error @{account} стр.{page+1} (только www): {www_feed_exc}")
+                if errors is not None:
+                    _append_error(
+                        errors, person_name, "instagram", account, "feed_error", str(www_feed_exc)[:300]
+                    )
+                break
+            try:
+                feed = L.context.get_iphone_json(
+                    f"api/v1/feed/user/{user_id}/",
+                    params=params,
+                )
+                if page == 0:
+                    print(f"[instagram] лента @{account}: i.instagram.com (www не сработал)")
+            except Exception as exc:
+                print(
+                    f"[instagram] feed error @{account} стр.{page+1}: www: {www_feed_exc}; "
+                    f"i.instagram: {exc}"
+                )
                 if errors is not None:
                     _append_error(errors, person_name, "instagram", account, "feed_error", str(exc)[:300])
                 break
