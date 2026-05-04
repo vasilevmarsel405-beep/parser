@@ -477,6 +477,17 @@ def fetch_vk_posts(
 _INSTALOADER: Optional[instaloader.Instaloader] = None
 
 
+def _instagram_request_timeout() -> float:
+    """Instaloader по умолчанию ждёт ответ до 300 с — на VPS это выглядит как «зависло»."""
+    raw = (os.getenv("INSTAGRAM_REQUEST_TIMEOUT") or "").strip()
+    if not raw:
+        return 45.0
+    try:
+        return max(15.0, min(float(raw), 120.0))
+    except ValueError:
+        return 45.0
+
+
 def _get_instaloader() -> Optional[instaloader.Instaloader]:
     """Единый экземпляр Instaloader. Авторизация через sessionid из браузера — пароль не нужен."""
     global _INSTALOADER
@@ -504,8 +515,9 @@ def _get_instaloader() -> Optional[instaloader.Instaloader]:
         save_metadata=False,
         compress_json=False,
         quiet=True,
-        max_connection_attempts=5,
+        max_connection_attempts=3,
         iphone_support=True,
+        request_timeout=_instagram_request_timeout(),
     )
 
     # Вставляем куки прямо в сессию instaloader — без пароля и 2FA
@@ -543,18 +555,45 @@ def fetch_instagram_posts(
     fetched_at = now_iso()
     max_items = (history_cap if history_cap else 500) if full_history else limit
 
-    # Получаем user_id через iphone API (без GraphQL)
+    # Получаем user_id через iphone API (без GraphQL); ретраи при таймаутах/сети
+    data: Optional[dict] = None
+    profile_exc: Optional[BaseException] = None
+    for attempt in range(1, 5):
+        try:
+            data = L.context.get_iphone_json(
+                "api/v1/users/web_profile_info/",
+                params={"username": account},
+            )
+            break
+        except Exception as exc:
+            profile_exc = exc
+            err_s = str(exc).lower()
+            retryable = any(
+                x in err_s
+                for x in ("timeout", "timed out", "connection", "443", "reset", "temporar")
+            )
+            if attempt < 4 and retryable:
+                wait = min(5 * attempt, 25)
+                print(
+                    f"[instagram] web_profile_info @{account}: попытка {attempt}/4 — {exc}; "
+                    f"пауза {wait}s"
+                )
+                time.sleep(wait)
+            else:
+                break
+    if data is None:
+        exc = profile_exc or RuntimeError("web_profile_info: нет ответа")
+        print(f"[instagram] не удалось получить профиль @{account}: {exc}")
+        if errors is not None:
+            _append_error(errors, person_name, "instagram", account, "profile_error", str(exc)[:300])
+        return []
     try:
-        data = L.context.get_iphone_json(
-            "api/v1/users/web_profile_info/",
-            params={"username": account}
-        )
         user_info = data.get("data", {}).get("user") or {}
         user_id = user_info.get("id")
         if not user_id:
             raise ValueError("user_id не найден")
     except Exception as exc:
-        print(f"[instagram] не удалось получить профиль @{account}: {exc}")
+        print(f"[instagram] не удалось разобрать профиль @{account}: {exc}")
         if errors is not None:
             _append_error(errors, person_name, "instagram", account, "profile_error", str(exc)[:300])
         return []
