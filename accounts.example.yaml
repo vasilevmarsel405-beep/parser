@@ -1,0 +1,16 @@
+people:
+  - person_name: "Иван Петров"
+    telegram:
+      - "my_team_channel"   # username канала/чата БЕЗ @ (или numeric chat_id)
+    vk:
+      - "durov"          # screen_name or numeric owner_id
+    instagram:
+      - "instagram"      # public username
+
+  - person_name: "Анна Соколова"
+    telegram:
+      - "some_channel"
+    vk:
+      - "sample_public"
+    instagram:
+      - "natgeo"

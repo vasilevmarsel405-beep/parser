@@ -1,0 +1,7 @@
+.env
+.env.local
+.env.*.local
+service_account.json
+state.db
+__pycache__/
+.venv/
