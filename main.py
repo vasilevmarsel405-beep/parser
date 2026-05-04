@@ -1770,33 +1770,66 @@ def collect_posts(
     full_history: bool = False,
     errors: Optional[List[ErrorRecord]] = None,
     per_platform_max: int = 500,
+    sample_one_post_per_platform: bool = False,
 ) -> List[PostRecord]:
     cap = per_platform_max if full_history else None
     collected: List[PostRecord] = []
     for person in people:
         name = person.get("person_name", "Unknown")
-        for acc in person.get("vk", []) or []:
-            collected.extend(
-                fetch_vk_posts(
+        if sample_one_post_per_platform and not full_history:
+            vk_got = 0
+            for acc in person.get("vk", []) or []:
+                if vk_got >= 1:
+                    break
+                chunk = fetch_vk_posts(
                     name,
                     acc,
-                    limit=limit,
-                    full_history=full_history,
+                    limit=1,
+                    full_history=False,
                     errors=errors,
-                    history_cap=cap,
+                    history_cap=None,
                 )
-            )
-        for acc in person.get("instagram", []) or []:
-            collected.extend(
-                fetch_instagram_posts(
+                collected.extend(chunk)
+                if chunk:
+                    vk_got += len(chunk)
+            ig_got = 0
+            for acc in person.get("instagram", []) or []:
+                if ig_got >= 1:
+                    break
+                chunk = fetch_instagram_posts(
                     name,
                     acc,
-                    limit=limit,
-                    full_history=full_history,
+                    limit=1,
+                    full_history=False,
                     errors=errors,
-                    history_cap=cap,
+                    history_cap=None,
                 )
-            )
+                collected.extend(chunk)
+                if chunk:
+                    ig_got += len(chunk)
+        else:
+            for acc in person.get("vk", []) or []:
+                collected.extend(
+                    fetch_vk_posts(
+                        name,
+                        acc,
+                        limit=limit,
+                        full_history=full_history,
+                        errors=errors,
+                        history_cap=cap,
+                    )
+                )
+            for acc in person.get("instagram", []) or []:
+                collected.extend(
+                    fetch_instagram_posts(
+                        name,
+                        acc,
+                        limit=limit,
+                        full_history=full_history,
+                        errors=errors,
+                        history_cap=cap,
+                    )
+                )
     return collected
 
 
@@ -1818,12 +1851,18 @@ def run(
         if reset:
             clear_seen_posts(conn)
             clear_person_sheets_data(spreadsheet, people)
+        if dry_run and not full_history:
+            print(
+                "[dry-run] Сбор постов: не более 1 поста VK и 1 Instagram на каждого "
+                "(следующий аккаунт той же сети не опрашивается, если уже есть пост)."
+            )
         collected = collect_posts(
             people,
             limit=limit,
             full_history=full_history,
             errors=errors,
             per_platform_max=per_platform_max,
+            sample_one_post_per_platform=(dry_run and not full_history),
         )
         collected = dedupe_posts_in_memory(collected)
         if full_history:
@@ -1884,7 +1923,11 @@ if __name__ == "__main__":
         "--limit", type=int, default=1,
         help="How many latest posts to fetch per account (default: 1).",
     )
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Пробный прогон: не пишет в Sheets/state; собирает не более 1 поста VK и 1 Instagram на каждого.",
+    )
     parser.add_argument(
         "--full-history",
         action="store_true",
